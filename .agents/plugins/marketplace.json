@@ -1,0 +1,20 @@
+{
+  "name": "ghostty-claude-headless",
+  "interface": {
+    "displayName": "Ghostty Claude Headless"
+  },
+  "plugins": [
+    {
+      "name": "ask-claude-ghostty",
+      "source": {
+        "source": "local",
+        "path": "./plugins/codex/ask-claude-ghostty"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

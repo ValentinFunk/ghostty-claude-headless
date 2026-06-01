@@ -1,0 +1,20 @@
+{
+  "name": "ask-claude-ghostty",
+  "version": "0.1.0",
+  "description": "Expose the local Ghostty/libghostty-backed headless Claude runner to Codex as an MCP tool.",
+  "author": {
+    "name": "Valentin Funk"
+  },
+  "interface": {
+    "displayName": "Ask Claude Ghostty",
+    "shortDescription": "Ask the local Claude Code CLI through a Ghostty-backed headless terminal.",
+    "longDescription": "Ask Claude Ghostty exposes an ask_claude_ghostty MCP tool that invokes the local ghostty-claude-headless binary, which runs Claude Code in a real PTY with libghostty terminal parsing and a standalone-terminal environment.",
+    "developerName": "Valentin Funk",
+    "category": "Productivity",
+    "capabilities": ["Interactive"],
+    "defaultPrompt": [
+      "Use ask_claude_ghostty to ask local Claude for a second opinion."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

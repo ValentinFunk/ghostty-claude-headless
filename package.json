@@ -1,0 +1,15 @@
+{
+  "name": "ghostty-claude-headless",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "zig build",
+    "test": "zig build test",
+    "e2e": "zig build e2e",
+    "install-plugin": "node scripts/install-plugin.mjs",
+    "install-plugin:amp": "node scripts/install-plugin.mjs amp",
+    "install-plugin:codex": "node scripts/install-plugin.mjs codex",
+    "install-plugin:all": "node scripts/install-plugin.mjs all"
+  }
+}

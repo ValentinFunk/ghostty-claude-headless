@@ -1,0 +1,16 @@
+.{
+    .name = .ghostty_claude_headless,
+    .version = "0.1.0",
+    .fingerprint = 0xc0833bacfe9f6529,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .ghostty = .{ .path = "vendor/ghostty" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "vendor/ghostty",
+    },
+}

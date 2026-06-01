@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "ask-claude-ghostty": {
+      "command": "/usr/bin/env",
+      "args": ["node", "./scripts/ask-claude-ghostty-mcp.mjs"],
+      "note": "Local MCP server exposing ask_claude_ghostty. For reliable local installation from this repo, prefer `yarn install-plugin codex`, which registers the absolute script path and binary path with Codex."
+    }
+  }
+}
