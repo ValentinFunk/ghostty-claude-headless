@@ -219,6 +219,15 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
     const startup_deadline = nowMs() + cfg.startup_timeout_ms;
     try readUntilReady(alloc, master_fd, &stream, &terminal, &raw, &responder, startup_deadline);
     try waitForOutputIdle(master_fd, &stream, &terminal, &raw, &responder, 1000, cfg.startup_timeout_ms);
+    _ = try confirmTrustPromptIfPresent(
+        alloc,
+        master_fd,
+        &stream,
+        &terminal,
+        &raw,
+        &responder,
+        cfg.startup_timeout_ms,
+    );
 
     if (cfg.ensure_auto_mode) {
         try ensureAutoMode(alloc, master_fd, &stream, &terminal, &raw, &responder);
@@ -460,6 +469,41 @@ fn hasText(alloc: std.mem.Allocator, terminal: *ghostty_vt.Terminal, raw: *std.I
     const screen = try terminal.plainString(alloc);
     defer alloc.free(screen);
     return std.ascii.indexOfIgnoreCase(screen, needle) != null or std.ascii.indexOfIgnoreCase(raw.written(), needle) != null;
+}
+
+fn confirmTrustPromptIfPresent(
+    alloc: std.mem.Allocator,
+    fd: c_int,
+    stream: *ghostty_vt.TerminalStream,
+    terminal: *ghostty_vt.Terminal,
+    raw: *std.Io.Writer.Allocating,
+    responder: *ProbeResponder,
+    timeout_ms: i64,
+) !bool {
+    const screen = try terminal.plainString(alloc);
+    defer alloc.free(screen);
+    const screen_has_prompt = try containsTrustDirectoryPrompt(alloc, screen);
+    const raw_has_prompt = try containsTrustDirectoryPrompt(alloc, raw.written());
+    if (!screen_has_prompt and !raw_has_prompt) return false;
+
+    try writeAllFd(fd, "\r");
+    try waitForOutputIdle(fd, stream, terminal, raw, responder, 1000, timeout_ms);
+    return true;
+}
+
+fn containsTrustDirectoryPrompt(alloc: std.mem.Allocator, haystack: []const u8) !bool {
+    return (try containsNormalizedAscii(alloc, haystack, "quicksafetycheck")) and
+        (try containsNormalizedAscii(alloc, haystack, "yesitrustthisfolder"));
+}
+
+fn containsNormalizedAscii(alloc: std.mem.Allocator, haystack: []const u8, normalized_needle: []const u8) !bool {
+    var normalized: std.Io.Writer.Allocating = .init(alloc);
+    defer normalized.deinit();
+    for (haystack) |ch| {
+        if (!std.ascii.isAlphanumeric(ch)) continue;
+        try normalized.writer.writeByte(std.ascii.toLower(ch));
+    }
+    return std.mem.indexOf(u8, normalized.written(), normalized_needle) != null;
 }
 
 fn pumpPty(fd: c_int, stream: *ghostty_vt.TerminalStream, raw: *std.Io.Writer.Allocating, responder: *ProbeResponder, timeout_ms: i32) !void {
@@ -934,6 +978,32 @@ test "screen fallback ignores a prompt without assistant activity" {
     try std.testing.expect(!hasReturnedIdlePromptAfterAssistantOnScreen(
         "❯",
         \\❯
+        \\
+    ));
+}
+
+test "detect Claude directory trust prompt from screen text" {
+    try std.testing.expect(try containsTrustDirectoryPrompt(
+        std.testing.allocator,
+        \\Quick safety check: Is this a project you created or one you trust?
+        \\❯ 1. Yes, I trust this folder
+        \\  2. No, exit
+        \\
+    ));
+}
+
+test "detect Claude directory trust prompt from compact raw buffer" {
+    try std.testing.expect(try containsTrustDirectoryPrompt(
+        std.testing.allocator,
+        "Quicksafetycheck:Isthisaprojectyoucreatedoroneyoutrust?❯1.Yes,Itrustthisfolder\r\n2.No,exit",
+    ));
+}
+
+test "do not mistake normal Claude prompt for directory trust prompt" {
+    try std.testing.expect(!try containsTrustDirectoryPrompt(
+        std.testing.allocator,
+        \\Claude Code
+        \\❯ Try "create a util logging.py that..."
         \\
     ));
 }
