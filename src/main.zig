@@ -26,6 +26,11 @@ const default_cell_width_px: u32 = 9;
 const default_cell_height_px: u32 = 18;
 const ghostty_version = "1.3.2-dev";
 const ghostty_xtversion = "ghostty " ++ ghostty_version;
+const debug_render_interval_ms: i64 = 250;
+const no_progress_timeout_ms: i64 = 30 * 1000;
+const final_transcript_after_spinner_timeout_ms: i64 = 10 * 1000;
+const latest_debug_screen_path = "/tmp/ghostty-claude-headless-latest.screen.txt";
+const latest_debug_meta_path = "/tmp/ghostty-claude-headless-latest.meta.txt";
 
 var active_pty_fd: c_int = -1;
 var active_cols: u16 = default_cols;
@@ -47,6 +52,98 @@ const Config = struct {
 const ClaudeResponse = struct {
     text: []const u8,
 };
+
+const TerminalDebug = struct {
+    alloc: std.mem.Allocator,
+    session_id: []const u8,
+    screen_path: []u8,
+    meta_path: []u8,
+    last_render_ms: i64 = 0,
+
+    fn init(alloc: std.mem.Allocator, session_id: []const u8) !TerminalDebug {
+        const screen_path = try std.fmt.allocPrint(alloc, "/tmp/ghostty-claude-headless-{s}.screen.txt", .{session_id});
+        errdefer alloc.free(screen_path);
+        const meta_path = try std.fmt.allocPrint(alloc, "/tmp/ghostty-claude-headless-{s}.meta.txt", .{session_id});
+        errdefer alloc.free(meta_path);
+        return .{
+            .alloc = alloc,
+            .session_id = session_id,
+            .screen_path = screen_path,
+            .meta_path = meta_path,
+        };
+    }
+
+    fn deinit(self: *TerminalDebug) void {
+        self.alloc.free(self.screen_path);
+        self.alloc.free(self.meta_path);
+    }
+
+    fn writeMeta(self: *TerminalDebug, cfg: Config, child_pid: c.pid_t) void {
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        out.writer.print(
+            \\session_id={s}
+            \\runner_pid={}
+            \\claude_pid={}
+            \\cwd={s}
+            \\claude={s}
+            \\screen_path={s}
+            \\meta_path={s}
+            \\latest_screen_path={s}
+            \\latest_meta_path={s}
+            \\
+        , .{
+            self.session_id,
+            c.getpid(),
+            child_pid,
+            cfg.cwd,
+            cfg.claude,
+            self.screen_path,
+            self.meta_path,
+            latest_debug_screen_path,
+            latest_debug_meta_path,
+        }) catch return;
+        writeDebugFile(self.meta_path, out.written());
+        writeDebugFile(latest_debug_meta_path, out.written());
+    }
+
+    fn render(self: *TerminalDebug, terminal: *ghostty_vt.Terminal, raw: []const u8, force: bool) void {
+        const now = nowMs();
+        if (!force and now - self.last_render_ms < debug_render_interval_ms) return;
+        self.last_render_ms = now;
+
+        const screen = terminal.plainString(self.alloc) catch return;
+        defer self.alloc.free(screen);
+
+        const raw_tail_start = if (raw.len > 8000) raw.len - 8000 else 0;
+        const raw_tail = raw[raw_tail_start..];
+
+        var out: std.Io.Writer.Allocating = .init(self.alloc);
+        defer out.deinit();
+        out.writer.print(
+            \\ghostty-claude-headless terminal snapshot
+            \\session_id={s}
+            \\updated_ms={}
+            \\raw_bytes={}
+            \\
+            \\--- screen ---
+            \\{s}
+            \\
+            \\--- raw_tail ---
+            \\{s}
+            \\
+        , .{ self.session_id, now, raw.len, screen, raw_tail }) catch return;
+
+        writeDebugFile(self.screen_path, out.written());
+        writeDebugFile(latest_debug_screen_path, out.written());
+    }
+};
+
+fn writeDebugFile(path: []const u8, contents: []const u8) void {
+    var file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
+    defer file.close();
+    file.writeAll(contents) catch return;
+}
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -180,6 +277,9 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
     const session_id = try createUuid(alloc);
     defer alloc.free(session_id);
 
+    var terminal_debug = try TerminalDebug.init(alloc, session_id);
+    defer terminal_debug.deinit();
+
     var terminal: ghostty_vt.Terminal = try .init(alloc, .{ .cols = cfg.cols, .rows = cfg.rows, .max_scrollback = 2000 });
     defer terminal.deinit(alloc);
 
@@ -199,7 +299,8 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
 
     var master_fd: c_int = -1;
     const child_pid = try forkClaude(alloc, &master_fd, cfg, session_id);
-    var child_running = true;
+    const child_running = true;
+    terminal_debug.writeMeta(cfg, child_pid);
     active_pty_fd = master_fd;
     defer {
         active_pty_fd = -1;
@@ -213,12 +314,14 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
 
     var raw = std.Io.Writer.Allocating.init(alloc);
     defer raw.deinit();
+    defer terminal_debug.render(&terminal, raw.written(), true);
     var responder = ProbeResponder.init(alloc, master_fd, &terminal);
     defer responder.deinit();
+    terminal_debug.render(&terminal, raw.written(), true);
 
     const startup_deadline = nowMs() + cfg.startup_timeout_ms;
-    try readUntilReady(alloc, master_fd, &stream, &terminal, &raw, &responder, startup_deadline);
-    try waitForOutputIdle(master_fd, &stream, &terminal, &raw, &responder, 1000, cfg.startup_timeout_ms);
+    try readUntilReady(alloc, master_fd, &stream, &terminal, &raw, &responder, &terminal_debug, startup_deadline);
+    try waitForOutputIdle(alloc, master_fd, &stream, &terminal, &raw, &responder, &terminal_debug, 1000, cfg.startup_timeout_ms);
     _ = try confirmTrustPromptIfPresent(
         alloc,
         master_fd,
@@ -226,15 +329,16 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
         &terminal,
         &raw,
         &responder,
+        &terminal_debug,
         cfg.startup_timeout_ms,
     );
 
     if (cfg.ensure_auto_mode) {
-        try ensureAutoMode(alloc, master_fd, &stream, &terminal, &raw, &responder);
+        try ensureAutoMode(alloc, master_fd, &stream, &terminal, &raw, &responder, &terminal_debug);
     }
 
-    const prompt_raw_start = raw.written().len;
     try sendBracketedPaste(master_fd, cfg.prompt);
+    try ensurePromptSubmitted(alloc, master_fd, &stream, &terminal, &raw, &responder, &terminal_debug);
     const response_deadline = nowMs() + cfg.max_timeout_ms;
 
     const transcript_path = waitForTranscriptPath(
@@ -244,26 +348,28 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
         cfg.transcript_timeout_ms,
         master_fd,
         &stream,
+        &terminal,
         &raw,
         &responder,
+        &terminal_debug,
     ) catch |err| recover: {
         if (err != error.TranscriptTimeout) {
+            terminal_debug.render(&terminal, raw.written(), true);
             debugDump(raw.written());
             return err;
         }
         break :recover recoverTranscriptAfterVisibleResponse(
             alloc,
             session_id,
-            child_pid,
-            &child_running,
             master_fd,
             &stream,
             &terminal,
             &raw,
             &responder,
-            prompt_raw_start,
+            &terminal_debug,
             response_deadline,
         ) catch |recover_err| {
+            terminal_debug.render(&terminal, raw.written(), true);
             debugDump(raw.written());
             return recover_err;
         };
@@ -277,9 +383,12 @@ fn runClaudePrompt(alloc: std.mem.Allocator, cfg: Config) !ClaudeResponse {
         cfg.idle_timeout_ms,
         master_fd,
         &stream,
+        &terminal,
         &raw,
         &responder,
+        &terminal_debug,
     ) catch |err| {
+        terminal_debug.render(&terminal, raw.written(), true);
         debugDump(raw.written());
         return err;
     };
@@ -401,10 +510,11 @@ fn readUntilReady(
     terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
     deadline: i64,
 ) !void {
     while (nowMs() <= deadline) {
-        try pumpPty(fd, stream, raw, responder, 100);
+        try pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 100);
         const screen = try terminal.plainString(alloc);
         defer alloc.free(screen);
         if (std.mem.indexOf(u8, screen, "Claude Code") != null or
@@ -418,20 +528,21 @@ fn readUntilReady(
 }
 
 fn waitForOutputIdle(
+    alloc: std.mem.Allocator,
     fd: c_int,
     stream: *ghostty_vt.TerminalStream,
     terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
     idle_ms: i64,
     timeout_ms: i64,
 ) !void {
-    _ = terminal;
     const deadline = nowMs() + timeout_ms;
     var last_len = raw.written().len;
     var last_change = nowMs();
     while (nowMs() <= deadline) {
-        try pumpPty(fd, stream, raw, responder, 100);
+        try pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 100);
         if (raw.written().len != last_len) {
             last_len = raw.written().len;
             last_change = nowMs();
@@ -448,6 +559,7 @@ fn ensureAutoMode(
     terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
 ) !void {
     if (try hasText(alloc, terminal, raw, "auto mode on")) return;
 
@@ -456,9 +568,9 @@ fn ensureAutoMode(
         try writeAllFd(fd, "\x1b[Z");
         const deadline = nowMs() + 1000;
         while (nowMs() <= deadline) {
-            try pumpPty(fd, stream, raw, responder, 100);
+            try pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 100);
             if (try hasText(alloc, terminal, raw, "auto mode on")) {
-                try waitForOutputIdle(fd, stream, terminal, raw, responder, 250, 5000);
+                try waitForOutputIdle(alloc, fd, stream, terminal, raw, responder, terminal_debug, 250, 5000);
                 return;
             }
         }
@@ -478,6 +590,7 @@ fn confirmTrustPromptIfPresent(
     terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
     timeout_ms: i64,
 ) !bool {
     const screen = try terminal.plainString(alloc);
@@ -487,7 +600,7 @@ fn confirmTrustPromptIfPresent(
     if (!screen_has_prompt and !raw_has_prompt) return false;
 
     try writeAllFd(fd, "\r");
-    try waitForOutputIdle(fd, stream, terminal, raw, responder, 1000, timeout_ms);
+    try waitForOutputIdle(alloc, fd, stream, terminal, raw, responder, terminal_debug, 1000, timeout_ms);
     return true;
 }
 
@@ -506,7 +619,17 @@ fn containsNormalizedAscii(alloc: std.mem.Allocator, haystack: []const u8, norma
     return std.mem.indexOf(u8, normalized.written(), normalized_needle) != null;
 }
 
-fn pumpPty(fd: c_int, stream: *ghostty_vt.TerminalStream, raw: *std.Io.Writer.Allocating, responder: *ProbeResponder, timeout_ms: i32) !void {
+fn pumpPty(
+    alloc: std.mem.Allocator,
+    fd: c_int,
+    stream: *ghostty_vt.TerminalStream,
+    terminal: *ghostty_vt.Terminal,
+    raw: *std.Io.Writer.Allocating,
+    responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
+    timeout_ms: i32,
+) !void {
+    _ = alloc;
     var pfd = c.struct_pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
     const poll_result = c.poll(&pfd, 1, timeout_ms);
     if (poll_result < 0) return error.PollFailed;
@@ -521,12 +644,55 @@ fn pumpPty(fd: c_int, stream: *ghostty_vt.TerminalStream, raw: *std.Io.Writer.Al
     try raw.writer.writeAll(data);
     try responder.observe(data);
     stream.nextSlice(data);
+    terminal_debug.render(terminal, raw.written(), false);
 }
 
 fn sendBracketedPaste(fd: c_int, prompt: []const u8) !void {
     try writeAllFd(fd, "\x1b[200~");
     try writeAllFd(fd, prompt);
-    try writeAllFd(fd, "\x1b[201~\r");
+    try writeAllFd(fd, "\x1b[201~");
+}
+
+fn ensurePromptSubmitted(
+    alloc: std.mem.Allocator,
+    fd: c_int,
+    stream: *ghostty_vt.TerminalStream,
+    terminal: *ghostty_vt.Terminal,
+    raw: *std.Io.Writer.Allocating,
+    responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
+) !void {
+    var saw_pasted_prompt = false;
+    var observe_deadline = nowMs() + 1000;
+    while (nowMs() <= observe_deadline) {
+        try pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 50);
+        if (terminalHasActiveClaudeSpinner(alloc, terminal)) return;
+        if (terminalHasPastedPrompt(alloc, terminal)) {
+            saw_pasted_prompt = true;
+            break;
+        }
+    }
+
+    var attempts: u8 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        try writeAllFd(fd, "\r");
+        observe_deadline = nowMs() + 1000;
+        while (nowMs() <= observe_deadline) {
+            try pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 50);
+            if (terminalHasActiveClaudeSpinner(alloc, terminal)) return;
+            const has_pasted_prompt = terminalHasPastedPrompt(alloc, terminal);
+            if (saw_pasted_prompt and !has_pasted_prompt) return;
+            if (!saw_pasted_prompt and has_pasted_prompt) saw_pasted_prompt = true;
+        }
+        if (!saw_pasted_prompt) return;
+    }
+    return error.PromptSubmitTimeout;
+}
+
+fn terminalHasPastedPrompt(alloc: std.mem.Allocator, terminal: *ghostty_vt.Terminal) bool {
+    const screen = terminal.plainString(alloc) catch return false;
+    defer alloc.free(screen);
+    return std.mem.indexOf(u8, screen, "[Pasted text #") != null;
 }
 
 fn writePty(_: *ghostty_vt.TerminalStream.Handler, data: [:0]const u8) void {
@@ -647,16 +813,21 @@ fn waitForTranscriptPath(
     timeout_ms: i64,
     fd: c_int,
     stream: *ghostty_vt.TerminalStream,
+    terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
 ) ![]u8 {
     const deadline = nowMs() + timeout_ms;
+    var last_raw_len = raw.written().len;
+    var last_progress = nowMs();
     while (nowMs() <= deadline) {
-        try pumpPty(fd, stream, raw, responder, 50);
+        try pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 50);
         const expected = try expectedTranscriptPath(alloc, cwd, session_id);
         if (fileExists(expected)) return expected;
         alloc.free(expected);
         if (try findTranscriptPathBySessionId(alloc, session_id)) |found| return found;
+        noteTerminalProgress(alloc, terminal, raw, &last_raw_len, &last_progress);
     }
     return error.TranscriptTimeout;
 }
@@ -664,74 +835,104 @@ fn waitForTranscriptPath(
 fn recoverTranscriptAfterVisibleResponse(
     alloc: std.mem.Allocator,
     session_id: []const u8,
-    child_pid: c.pid_t,
-    child_running: *bool,
     fd: c_int,
     stream: *ghostty_vt.TerminalStream,
     terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
-    prompt_raw_start: usize,
+    terminal_debug: *TerminalDebug,
     response_deadline: i64,
 ) ![]u8 {
+    var last_raw_len = raw.written().len;
+    var last_progress = nowMs();
     while (nowMs() <= response_deadline) {
-        pumpPty(fd, stream, raw, responder, 50) catch |err| switch (err) {
+        pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 50) catch |err| switch (err) {
             error.PtyClosed => break,
             else => return err,
         };
         if (try findTranscriptPathBySessionId(alloc, session_id)) |found| return found;
-        const after_prompt = raw.written()[@min(prompt_raw_start, raw.written().len)..];
-        debugRecoveryState(alloc, terminal, after_prompt);
-        if (try hasReturnedIdlePromptAfterAssistant(alloc, terminal, after_prompt)) {
-            try waitForOutputIdle(fd, stream, terminal, raw, responder, 750, 5000);
-            const idle_after_prompt = raw.written()[@min(prompt_raw_start, raw.written().len)..];
-            if (!try hasReturnedIdlePromptAfterAssistant(alloc, terminal, idle_after_prompt)) continue;
-            terminateChild(child_pid, child_running);
-            const flush_deadline = nowMs() + 5000;
-            while (nowMs() <= flush_deadline) {
-                if (try findTranscriptPathBySessionId(alloc, session_id)) |found| return found;
-                std.Thread.sleep(50 * std.time.ns_per_ms);
-            }
-            return error.TranscriptTimeout;
-        }
+        noteTerminalProgress(alloc, terminal, raw, &last_raw_len, &last_progress);
+        if (nowMs() - last_progress > no_progress_timeout_ms) return error.TranscriptNoProgress;
     }
     return error.TranscriptTimeout;
 }
 
-fn debugRecoveryState(alloc: std.mem.Allocator, terminal: *ghostty_vt.Terminal, bytes: []const u8) void {
-    if (std.posix.getenv("GHOSTTY_CLAUDE_DEBUG") == null) return;
-    const assistant = std.mem.indexOf(u8, bytes, "⏺") != null;
-    const raw_prompt = std.mem.indexOf(u8, bytes, "❯") != null;
-    const idle_prompt = if (terminal.plainString(alloc)) |screen| idle: {
-        defer alloc.free(screen);
-        break :idle screenHasIdleClaudePrompt(screen);
-    } else |_| false;
-    if (assistant or raw_prompt or idle_prompt) {
-        std.debug.print("\n[ghostty-claude-headless recovery assistant={} raw_prompt={} idle_prompt={} len={}]\n", .{ assistant, raw_prompt, idle_prompt, bytes.len });
+fn noteTerminalProgress(
+    alloc: std.mem.Allocator,
+    terminal: *ghostty_vt.Terminal,
+    raw: *std.Io.Writer.Allocating,
+    last_raw_len: *usize,
+    last_progress: *i64,
+) void {
+    if (raw.written().len != last_raw_len.*) {
+        last_raw_len.* = raw.written().len;
+        last_progress.* = nowMs();
+        return;
+    }
+    if (terminalHasActiveClaudeSpinner(alloc, terminal)) {
+        last_progress.* = nowMs();
     }
 }
 
-fn hasReturnedIdlePromptAfterAssistant(alloc: std.mem.Allocator, terminal: *ghostty_vt.Terminal, bytes: []const u8) !bool {
-    const screen = try terminal.plainString(alloc);
+fn terminalHasActiveClaudeSpinner(alloc: std.mem.Allocator, terminal: *ghostty_vt.Terminal) bool {
+    const screen = terminal.plainString(alloc) catch return false;
     defer alloc.free(screen);
-    return hasReturnedIdlePromptAfterAssistantOnScreen(bytes, screen);
+    return screenHasActiveClaudeSpinner(screen);
 }
 
-fn hasReturnedIdlePromptAfterAssistantOnScreen(bytes: []const u8, screen: []const u8) bool {
-    return hasAssistantActivity(bytes) and screenHasIdleClaudePrompt(screen);
-}
-
-fn hasAssistantActivity(bytes: []const u8) bool {
-    return std.mem.indexOf(u8, bytes, "⏺") != null;
-}
-
-fn screenHasIdleClaudePrompt(screen: []const u8) bool {
+fn screenHasActiveClaudeSpinner(screen: []const u8) bool {
     var lines = std.mem.splitScalar(u8, screen, '\n');
     while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, &std.ascii.whitespace);
-        if (std.mem.eql(u8, trimmed, "❯")) return true;
+        if (isActiveSpinnerLine(line)) return true;
     }
     return false;
+}
+
+fn isActiveSpinnerLine(line: []const u8) bool {
+    const trimmed = trimTerminalStatusWhitespace(line);
+    return startsWithSpinnerStatus(trimmed, "✢") or
+        startsWithSpinnerStatus(trimmed, "✳") or
+        startsWithSpinnerStatus(trimmed, "✶") or
+        startsWithSpinnerStatus(trimmed, "✻") or
+        startsWithSpinnerStatus(trimmed, "✽") or
+        startsWithSpinnerStatus(trimmed, "*") or
+        startsWithSpinnerStatus(trimmed, "·");
+}
+
+fn startsWithSpinnerStatus(line: []const u8, glyph: []const u8) bool {
+    if (!std.mem.startsWith(u8, line, glyph)) return false;
+    const rest = line[glyph.len..];
+    if (!startsWithTerminalStatusWhitespace(rest)) return false;
+    return std.mem.indexOf(u8, rest, "…") != null;
+}
+
+fn startsWithTerminalStatusWhitespace(value: []const u8) bool {
+    return value.len > 0 and (std.ascii.isWhitespace(value[0]) or std.mem.startsWith(u8, value, "\xc2\xa0"));
+}
+
+fn trimTerminalStatusWhitespace(value: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < value.len) {
+        if (std.ascii.isWhitespace(value[start])) {
+            start += 1;
+        } else if (std.mem.startsWith(u8, value[start..], "\xc2\xa0")) {
+            start += 2;
+        } else {
+            break;
+        }
+    }
+
+    var end = value.len;
+    while (end > start) {
+        if (std.ascii.isWhitespace(value[end - 1])) {
+            end -= 1;
+        } else if (end >= start + 2 and std.mem.eql(u8, value[end - 2 .. end], "\xc2\xa0")) {
+            end -= 2;
+        } else {
+            break;
+        }
+    }
+    return value[start..end];
 }
 
 fn terminateChild(child_pid: c.pid_t, child_running: *bool) void {
@@ -782,34 +983,58 @@ fn waitForAssistantText(
     idle_timeout_ms: i64,
     fd: c_int,
     stream: *ghostty_vt.TerminalStream,
+    terminal: *ghostty_vt.Terminal,
     raw: *std.Io.Writer.Allocating,
     responder: *ProbeResponder,
+    terminal_debug: *TerminalDebug,
 ) ![]u8 {
     const deadline = nowMs() + max_timeout_ms;
     var last_size: usize = 0;
     var last_change = nowMs();
+    var last_raw_len = raw.written().len;
+    var last_progress = nowMs();
+    var saw_spinner = false;
+    var last_spinner_seen = nowMs();
 
     while (nowMs() <= deadline) {
-        pumpPty(fd, stream, raw, responder, 50) catch |err| switch (err) {
+        pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 50) catch |err| switch (err) {
             error.PtyClosed => {},
             else => return err,
         };
+        const spinner_active = terminalHasActiveClaudeSpinner(alloc, terminal);
+        if (spinner_active) {
+            saw_spinner = true;
+            last_spinner_seen = nowMs();
+            last_progress = nowMs();
+        }
+        if (raw.written().len != last_raw_len) {
+            last_raw_len = raw.written().len;
+            last_progress = nowMs();
+        }
+
         const content = std.fs.cwd().readFileAlloc(alloc, path, 64 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => {
                 continue;
             },
             else => return err,
         };
-        defer alloc.free(content);
 
         if (content.len != last_size) {
             last_size = content.len;
             last_change = nowMs();
-        } else if (nowMs() - last_change > idle_timeout_ms) {
-            return error.TranscriptIdleTimeout;
+            last_progress = nowMs();
         }
 
-        if (try finalAssistantText(alloc, content)) |text| return text;
+        const text = try finalAssistantText(alloc, content);
+        alloc.free(content);
+        if (text) |final_text| return final_text;
+
+        const now = nowMs();
+        if (saw_spinner and !spinner_active and now - last_spinner_seen > final_transcript_after_spinner_timeout_ms) {
+            return error.FinalTranscriptTimeout;
+        }
+        if (now - last_progress > no_progress_timeout_ms) return error.ResponseNoProgress;
+        if (now - last_change > idle_timeout_ms) return error.TranscriptIdleTimeout;
     }
     return error.ResponseTimeout;
 }
@@ -954,31 +1179,18 @@ test "do not return or leak partial assistant text before end_turn" {
     try std.testing.expect((try finalAssistantText(alloc, jsonl)) == null);
 }
 
-test "screen fallback requires an idle Claude input prompt after assistant activity" {
-    try std.testing.expect(hasReturnedIdlePromptAfterAssistantOnScreen(
-        "⏺ Done.",
-        \\⏺ Done.
-        \\
-        \\❯
-        \\
+test "detect Claude spinner status rows without prompt glyphs" {
+    try std.testing.expect(screenHasActiveClaudeSpinner(
+        "* Subscribing to Grok SuperHeavy… (30s)\n",
+    ));
+    try std.testing.expect(screenHasActiveClaudeSpinner(
+        "✻ Searching for 1 pattern…\n",
     ));
 }
 
-test "screen fallback ignores tool permission/menu prompts" {
-    try std.testing.expect(!hasReturnedIdlePromptAfterAssistantOnScreen(
-        "⏺ I'll inspect the directory.\n❯ 1. Yes",
-        \\Allow Claude to run Bash(ls)?
-        \\❯ 1. Yes
-        \\  2. No
-        \\
-    ));
-}
-
-test "screen fallback ignores a prompt without assistant activity" {
-    try std.testing.expect(!hasReturnedIdlePromptAfterAssistantOnScreen(
-        "❯",
-        \\❯
-        \\
+test "do not mistake markdown bullets for spinner status" {
+    try std.testing.expect(!screenHasActiveClaudeSpinner(
+        "* cleanup must be tree-aware\n· a normal bullet without ellipsis\n",
     ));
 }
 
