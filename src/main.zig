@@ -994,7 +994,7 @@ fn waitForAssistantText(
     var last_raw_len = raw.written().len;
     var last_progress = nowMs();
     var saw_spinner = false;
-    var last_spinner_seen = nowMs();
+    var last_spinner_or_response_progress = nowMs();
 
     while (nowMs() <= deadline) {
         pumpPty(alloc, fd, stream, terminal, raw, responder, terminal_debug, 50) catch |err| switch (err) {
@@ -1002,14 +1002,17 @@ fn waitForAssistantText(
             else => return err,
         };
         const spinner_active = terminalHasActiveClaudeSpinner(alloc, terminal);
+        var saw_progress_this_tick = false;
         if (spinner_active) {
             saw_spinner = true;
-            last_spinner_seen = nowMs();
-            last_progress = nowMs();
+            const now = nowMs();
+            last_spinner_or_response_progress = now;
+            last_progress = now;
         }
         if (raw.written().len != last_raw_len) {
             last_raw_len = raw.written().len;
             last_progress = nowMs();
+            saw_progress_this_tick = true;
         }
 
         const content = std.fs.cwd().readFileAlloc(alloc, path, 64 * 1024 * 1024) catch |err| switch (err) {
@@ -1023,6 +1026,7 @@ fn waitForAssistantText(
             last_size = content.len;
             last_change = nowMs();
             last_progress = nowMs();
+            saw_progress_this_tick = true;
         }
 
         const text = try finalAssistantText(alloc, content);
@@ -1030,7 +1034,10 @@ fn waitForAssistantText(
         if (text) |final_text| return final_text;
 
         const now = nowMs();
-        if (saw_spinner and !spinner_active and now - last_spinner_seen > final_transcript_after_spinner_timeout_ms) {
+        if (saw_spinner and !spinner_active and saw_progress_this_tick) {
+            last_spinner_or_response_progress = now;
+        }
+        if (saw_spinner and !spinner_active and now - last_spinner_or_response_progress > final_transcript_after_spinner_timeout_ms) {
             return error.FinalTranscriptTimeout;
         }
         if (now - last_progress > no_progress_timeout_ms) return error.ResponseNoProgress;
